@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-AI Usage Monitor for Claude Code & Antigravity.
+AI Usage Monitor for Claude Code & Google Antigravity.
 Renders clean graphical progress bars tailored for cmux Dock and narrow terminal splits.
 """
 import glob
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
+
+# Cache antigravity quota for 60 seconds to avoid spamming the API
+_AGY_CACHE = {"data": None, "ts": 0}
 
 def get_terminal_width():
     try:
@@ -43,7 +47,6 @@ def render_bar(percentage, width=18, color="\033[1;32m"):
     return f"{bar} {bar_color}{int(pct):>3}%{RESET}"
 
 def get_claude_usage():
-    # 1. Check live rate limits cache from statusline
     cache_file = os.path.expanduser("~/.cache/claude-rate-limits.json")
     rate_limits = {}
     context_pct = 0.0
@@ -67,7 +70,6 @@ def get_claude_usage():
         except Exception:
             pass
 
-    # 2. Check cumulative token totals from stats-cache
     stats_file = os.path.expanduser("~/.claude/stats-cache.json")
     stats = {}
     if os.path.exists(stats_file):
@@ -90,7 +92,47 @@ def get_claude_usage():
         "stats": stats,
     }
 
+def fetch_antigravity_quota():
+    now = time.time()
+    if _AGY_CACHE["data"] and (now - _AGY_CACHE["ts"] < 60):
+        return _AGY_CACHE["data"]
+    try:
+        res = subprocess.run(
+            ["antigravity-usage", "--json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            d = json.loads(res.stdout)
+            _AGY_CACHE["data"] = d
+            _AGY_CACHE["ts"] = now
+            return d
+    except Exception:
+        pass
+    return _AGY_CACHE["data"]
+
 def get_antigravity_usage():
+    # 1. Quota from antigravity-usage CLI
+    quota_data = fetch_antigravity_quota()
+    quota_used_pct = None
+    reset_ms = None
+
+    if quota_data and "models" in quota_data:
+        # Find Gemini Flash / Pro quota
+        for m in quota_data["models"]:
+            if "gemini-3.8" in m.get("modelId", "") or "gemini-3-flash" in m.get("modelId", ""):
+                rem = m.get("remainingPercentage", 1.0)
+                quota_used_pct = (1.0 - rem) * 100.0
+                reset_ms = m.get("timeUntilResetMs")
+                break
+        if quota_used_pct is None and quota_data["models"]:
+            rem = quota_data["models"][0].get("remainingPercentage", 1.0)
+            quota_used_pct = (1.0 - rem) * 100.0
+            reset_ms = quota_data["models"][0].get("timeUntilResetMs")
+
+    # 2. Context and token logs
     brain_dir = os.path.expanduser("~/.gemini/antigravity-cli/brain")
     pattern = os.path.join(brain_dir, "**/.system_generated/logs/transcript.jsonl")
     transcripts = glob.glob(pattern, recursive=True)
@@ -129,11 +171,12 @@ def get_antigravity_usage():
         except Exception:
             pass
 
-    # Gemini 3.8 / 3.7 Flash context limit is typically 1,000,000 tokens
     context_limit = 1_000_000
     context_pct = min(100.0, (latest_context_tokens / context_limit) * 100) if latest_context_tokens else 0.0
 
     return {
+        "quota_used_pct": quota_used_pct,
+        "reset_ms": reset_ms,
         "conversations": len(transcripts),
         "total_in": total_in,
         "total_out": total_out,
@@ -175,26 +218,22 @@ def render():
     # 1. CLAUDE CODE SECTION
     lines.append(f"{CYAN}{BOLD}Claude Code{RESET}")
     
-    # 5-hour limit
     five_pct = c_use["five_hour_pct"] if c_use["five_hour_pct"] is not None else 53.0
-    reset_hint = ""
+    c_reset_hint = ""
     if c_use["resets_at"]:
         try:
             r_str = time.strftime("%H:%M", time.localtime(c_use["resets_at"]))
-            reset_hint = f" {DIM}→{r_str}{RESET}"
+            c_reset_hint = f" {DIM}→{r_str}{RESET}"
         except Exception:
             pass
-    lines.append(f"  5h Limit {render_bar(five_pct, bar_width, CYAN)}{reset_hint}")
+    lines.append(f"  5h Limit {render_bar(five_pct, bar_width, CYAN)}{c_reset_hint}")
 
-    # Weekly limit
     wk_pct = c_use["week_pct"] if c_use["week_pct"] is not None else 0.0
     lines.append(f"  Weekly   {render_bar(wk_pct, bar_width, CYAN)}")
 
-    # Context window
     ctx_pct = c_use["context_pct"] if c_use["context_pct"] is not None else 18.0
     lines.append(f"  Context  {render_bar(ctx_pct, bar_width, CYAN)}")
 
-    # Totals
     s = c_use["stats"]
     if s:
         lines.append(f"  {DIM}Tokens: {fmt_num(s.get('input',0)+s.get('output',0))} | Cache: {fmt_num(s.get('cache_read',0))}{RESET}")
@@ -204,6 +243,15 @@ def render():
     # 2. ANTIGRAVITY SECTION
     lines.append(f"{MAGENTA}{BOLD}Google Antigravity{RESET}")
     
+    # Live Quota / Rate Limit
+    if a_use["quota_used_pct"] is not None:
+        a_reset_hint = ""
+        if a_use["reset_ms"]:
+            target_epoch = time.time() + (a_use["reset_ms"] / 1000.0)
+            r_str = time.strftime("%H:%M", time.localtime(target_epoch))
+            a_reset_hint = f" {DIM}→{r_str}{RESET}"
+        lines.append(f"  Quota    {render_bar(a_use['quota_used_pct'], bar_width, MAGENTA)}{a_reset_hint}")
+
     # Context window of current active session
     lines.append(f"  Context  {render_bar(a_use['context_pct'], bar_width, MAGENTA)}")
     
@@ -219,7 +267,6 @@ def render():
 
 def main():
     try:
-        # Hide cursor
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
         while True:
@@ -229,7 +276,6 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # Restore cursor
         sys.stdout.write("\033[?25h\n")
         sys.stdout.flush()
 
